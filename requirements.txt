@@ -1,0 +1,5 @@
+instaloader
+pymongo
+requests
+Pillow
+python-dotenv
