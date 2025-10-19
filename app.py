@@ -7,7 +7,7 @@ from pymongo import MongoClient
 from bson.binary import Binary
 from pathlib import Path
 from typing import Set, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Thread, Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
@@ -33,35 +33,29 @@ sessions_col = db["sessions"]
 stories_col = db["stories"]
 stats_col = db["stats"]
 
-# === GLOBAL LOCK & STATS ===
+# === GLOBAL LOCK ===
 stats_lock = Lock()
 app_start_time = datetime.utcnow()
-stats = {
-    "stories_sent": 0,
-    "stories_processed": 0,
-    "last_update": None,
-}
 
-def save_stats():
-    with stats_lock:
-        stats["last_update"] = datetime.utcnow().isoformat()
-        stats_col.update_one(
-            {"_id": "app_stats"},
-            {"$set": stats},
-            upsert=True
-        )
+# === USER STATS MANAGEMENT ===
+def save_user_stats(username: str, user_stats: dict):
+    user_stats["last_update"] = datetime.utcnow().isoformat()
+    stats_col.update_one(
+        {"_id": f"stats_{username}"},
+        {"$set": user_stats},
+        upsert=True
+    )
 
-def load_stats():
-    doc = stats_col.find_one({"_id": "app_stats"})
+def load_user_stats(username: str) -> dict:
+    doc = stats_col.find_one({"_id": f"stats_{username}"})
     if doc:
-        with stats_lock:
-            stats.update({
-                "stories_sent": doc.get("stories_sent", 0),
-                "stories_processed": doc.get("stories_processed", 0),
-                "last_update": doc.get("last_update")
-            })
-
-load_stats()
+        return {
+            "stories_sent": doc.get("stories_sent", 0),
+            "stories_processed": doc.get("stories_processed", 0),
+            "last_update": doc.get("last_update")
+        }
+    else:
+        return {"stories_sent": 0, "stories_processed": 0, "last_update": None}
 
 # === HTTP SERVER ===
 class HealthHandler(BaseHTTPRequestHandler):
@@ -78,14 +72,15 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"OK")
         elif self.path == "/health":
             with stats_lock:
+                per_user_stats = {
+                    u: load_user_stats(u) for u in USERNAMES
+                }
                 data = {
                     "status": "running",
                     "uptime_seconds": (datetime.utcnow() - app_start_time).total_seconds(),
-                    "stories_sent": stats["stories_sent"],
-                    "stories_processed": stats["stories_processed"],
-                    "last_update": stats["last_update"],
                     "monitored_users": USERNAMES,
                     "db_connected": mongo is not None,
+                    "per_user_stats": per_user_stats
                 }
             self._send_json(data)
         else:
@@ -216,9 +211,6 @@ class TelegramSender:
                 resp = requests.post(url, data=data, files=files, timeout=60)
             if resp.ok:
                 print(f"✅ Sent to Telegram: {os.path.basename(file_path)}")
-                with stats_lock:
-                    stats["stories_sent"] += 1
-                    save_stats()
                 return True
             else:
                 print(f"⚠️ Telegram API error: {resp.status_code} - {resp.text}")
@@ -283,15 +275,14 @@ class StoryMonitor:
         )
         self.loader.load_session_from_file(SESSION_USERNAME, session_path)
         self.downloader = StoryDownloader(self.loader)
-    
+        self.user_stats = {u: load_user_stats(u) for u in USERNAMES}
+
     def check_user_stories(self, username: str):
         print(f"\n🔍 Checking stories for @{username}...")
         seen_stories = StoryTracker.get_seen_stories(username)
-        
         try:
             profile = instaloader.Profile.from_username(self.loader.context, username)
             stories = self.loader.get_stories(userids=[profile.userid])
-            
             for story in stories:
                 for item in story.get_items():
                     story_id = str(item.mediaid)
@@ -300,11 +291,19 @@ class StoryMonitor:
                     
                     file_path = self.downloader.download_story(item, username)
                     if file_path:
-                        caption = f"Story from @{username}"
+                        timestamp = item.date_local.strftime("%Y-%m-%d %H:%M:%S")
+                        expiry = (item.date_local + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+                        caption = (
+                            f"📸 Story from @{username}\n"
+                            f"🕒 Uploaded: {timestamp}\n"
+                            f"⏳ Expires: {expiry}"
+                        )
                         success = self.telegram.send_file(file_path, caption)
                         with stats_lock:
-                            stats["stories_processed"] += 1
-                            save_stats()
+                            self.user_stats[username]["stories_processed"] += 1
+                            if success:
+                                self.user_stats[username]["stories_sent"] += 1
+                            save_user_stats(username, self.user_stats[username])
                         if success:
                             try:
                                 os.remove(file_path)
@@ -313,7 +312,7 @@ class StoryMonitor:
                     StoryTracker.mark_seen(username, story_id)
         except Exception as e:
             print(f"❌ Error checking @{username}: {e}")
-    
+
     def run_check_cycle(self):
         print(f"\n{'='*50}")
         print(f"🔄 Starting check cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -321,14 +320,12 @@ class StoryMonitor:
         for username in USERNAMES:
             self.check_user_stories(username)
         self.session_manager.save()
-    
+
     def run_forever(self):
         print("📡 Instagram Story Monitor Started")
         print(f"👥 Monitoring: {', '.join(USERNAMES)}")
         print(f"⏱️  Check interval: {CHECK_INTERVAL} seconds")
-        
         Thread(target=start_http_server, daemon=True).start()
-        
         try:
             while True:
                 self.run_check_cycle()
