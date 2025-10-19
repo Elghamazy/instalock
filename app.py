@@ -11,7 +11,7 @@ from datetime import datetime
 from threading import Thread, Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
-from dotenv import load_dotenv  # Make sure to install python-dotenv
+from dotenv import load_dotenv
 
 # === LOAD ENVIRONMENT VARIABLES ===
 load_dotenv()
@@ -24,23 +24,85 @@ USERNAMES = os.getenv("USERNAMES", "jaqxul,ssh.daemon").split(",")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "600"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
 
 # === DATABASE SETUP ===
 mongo = MongoClient(MONGO_URI)
 db = mongo[DB_NAME]
 sessions_col = db["sessions"]
 stories_col = db["stories"]
+stats_col = db["stats"]
 
+# === GLOBAL LOCK & STATS ===
+stats_lock = Lock()
+app_start_time = datetime.utcnow()
+stats = {
+    "stories_sent": 0,
+    "stories_processed": 0,
+    "last_update": None,
+}
 
+def save_stats():
+    with stats_lock:
+        stats["last_update"] = datetime.utcnow().isoformat()
+        stats_col.update_one(
+            {"_id": "app_stats"},
+            {"$set": stats},
+            upsert=True
+        )
+
+def load_stats():
+    doc = stats_col.find_one({"_id": "app_stats"})
+    if doc:
+        with stats_lock:
+            stats.update({
+                "stories_sent": doc.get("stories_sent", 0),
+                "stories_processed": doc.get("stories_processed", 0),
+                "last_update": doc.get("last_update")
+            })
+
+load_stats()
+
+# === HTTP SERVER ===
+class HealthHandler(BaseHTTPRequestHandler):
+    def _send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2, default=str).encode())
+
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        elif self.path == "/health":
+            with stats_lock:
+                data = {
+                    "status": "running",
+                    "uptime_seconds": (datetime.utcnow() - app_start_time).total_seconds(),
+                    "stories_sent": stats["stories_sent"],
+                    "stories_processed": stats["stories_processed"],
+                    "last_update": stats["last_update"],
+                    "monitored_users": USERNAMES,
+                    "db_connected": mongo is not None,
+                }
+            self._send_json(data)
+        else:
+            self.send_error(404, "Not Found")
+
+def start_http_server():
+    server = HTTPServer(("0.0.0.0", HTTP_PORT), HealthHandler)
+    print(f"🌐 HTTP server started on port {HTTP_PORT}")
+    server.serve_forever()
+
+# === SESSION MANAGEMENT ===
 class SessionManager:
-    """Handle Instagram session persistence via MongoDB."""
-    
     def __init__(self, username: str):
         self.username = username
         self.temp_path = None
     
     def load(self) -> str:
-        """Load session from MongoDB to temporary file."""
         doc = sessions_col.find_one({"username": self.username})
         if not doc:
             raise Exception(f"No session found for {self.username} in MongoDB.")
@@ -56,7 +118,6 @@ class SessionManager:
         return self.temp_path
     
     def save(self):
-        """Save session back to MongoDB."""
         if not self.temp_path or not os.path.exists(self.temp_path):
             return
         
@@ -70,17 +131,14 @@ class SessionManager:
         )
     
     def cleanup(self):
-        """Remove temporary session file."""
         if self.temp_path and os.path.exists(self.temp_path):
             try:
                 os.remove(self.temp_path)
             except Exception as e:
                 print(f"Warning: Could not remove temp session file: {e}")
 
-
+# === STORY TRACKING ===
 class StoryTracker:
-    """Track which stories have been seen/sent."""
-    
     @staticmethod
     def get_seen_stories(username: str) -> Set[str]:
         doc = stories_col.find_one({"username": username})
@@ -95,10 +153,8 @@ class StoryTracker:
         )
         print(f"📝 Marked story {story_id} as seen for {username}")
 
-
+# === TELEGRAM ===
 class TelegramSender:
-    """Handle sending media to Telegram."""
-    
     def __init__(self, bot_token: str, chat_id: str):
         if not bot_token or not chat_id:
             raise ValueError("Missing Telegram bot token or chat ID.")
@@ -121,9 +177,6 @@ class TelegramSender:
                     img.convert('RGB').save(jpg_path, 'JPEG', quality=95)
             print(f"🔄 Converted WebP to JPG: {os.path.basename(jpg_path)}")
             return jpg_path
-        except ImportError:
-            print("⚠️ PIL/Pillow not installed. Install with: pip install Pillow")
-            return None
         except Exception as e:
             print(f"⚠️ WebP conversion failed: {e}")
             return None
@@ -141,21 +194,6 @@ class TelegramSender:
             if converted_file:
                 file_path = converted_file
                 ext = ".jpg"
-            else:
-                endpoint = "sendDocument"
-                file_param = "document"
-                url = f"{self.base_url}/{endpoint}"
-                try:
-                    with open(file_path, "rb") as f:
-                        files = {file_param: f}
-                        data = {"chat_id": self.chat_id}
-                        if caption:
-                            data["caption"] = caption
-                        resp = requests.post(url, data=data, files=files, timeout=60)
-                    return resp.ok
-                except Exception as e:
-                    print(f"❌ Failed to send to Telegram: {e}")
-                    return False
         
         if ext in [".jpg", ".jpeg", ".png", ".gif"]:
             endpoint = "sendPhoto"
@@ -178,6 +216,9 @@ class TelegramSender:
                 resp = requests.post(url, data=data, files=files, timeout=60)
             if resp.ok:
                 print(f"✅ Sent to Telegram: {os.path.basename(file_path)}")
+                with stats_lock:
+                    stats["stories_sent"] += 1
+                    save_stats()
                 return True
             else:
                 print(f"⚠️ Telegram API error: {resp.status_code} - {resp.text}")
@@ -189,13 +230,11 @@ class TelegramSender:
             if converted_file and os.path.exists(converted_file):
                 try:
                     os.remove(converted_file)
-                except Exception as e:
-                    print(f"⚠️ Could not remove converted file: {e}")
+                except Exception:
+                    pass
 
-
+# === DOWNLOADER ===
 class StoryDownloader:
-    """Download and manage Instagram stories."""
-    
     def __init__(self, loader: instaloader.Instaloader, download_dir: str = "/tmp/insta_stories"):
         self.loader = loader
         self.download_dir = Path(download_dir)
@@ -217,32 +256,21 @@ class StoryDownloader:
             return None
         
         new_files = set(user_dir.glob("*")) - existing_files
-        
         if not new_files:
-            print(f"⚠️ No new files found after download for story {story_id}")
-            possible_files = list(user_dir.glob(f"*{story_id}*"))
-            if possible_files:
-                return str(max(possible_files, key=lambda p: p.stat().st_mtime))
             return None
         
         media_files = [
             f for f in new_files 
             if f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.mp4', '.mov']
-        ]
-        
-        if not media_files:
-            media_files = list(new_files)
+        ] or list(new_files)
         
         if media_files:
             largest_file = max(media_files, key=lambda f: f.stat().st_size)
-            print(f"📥 Downloaded: {largest_file.name}")
             return str(largest_file)
         return None
 
-
+# === MONITOR ===
 class StoryMonitor:
-    """Main monitor that ties everything together."""
-    
     def __init__(self):
         self.session_manager = SessionManager(SESSION_USERNAME)
         self.telegram = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
@@ -264,35 +292,25 @@ class StoryMonitor:
             profile = instaloader.Profile.from_username(self.loader.context, username)
             stories = self.loader.get_stories(userids=[profile.userid])
             
-            new_count = 0
             for story in stories:
                 for item in story.get_items():
                     story_id = str(item.mediaid)
                     if story_id in seen_stories:
                         continue
-                    print(f"📸 New story found: {story_id}")
+                    
                     file_path = self.downloader.download_story(item, username)
                     if file_path:
                         caption = f"Story from @{username}"
                         success = self.telegram.send_file(file_path, caption)
+                        with stats_lock:
+                            stats["stories_processed"] += 1
+                            save_stats()
                         if success:
-                            new_count += 1
                             try:
                                 os.remove(file_path)
-                            except Exception as e:
-                                print(f"⚠️ Could not remove file: {e}")
-                        else:
-                            print(f"⚠️ Failed to send story {story_id}")
+                            except Exception:
+                                pass
                     StoryTracker.mark_seen(username, story_id)
-            
-            if new_count > 0:
-                print(f"✨ Sent {new_count} new story/stories from @{username}")
-            else:
-                print(f"✓ No new stories from @{username}")
-        except instaloader.exceptions.ProfileNotExistsException:
-            print(f"❌ Profile does not exist: @{username}")
-        except instaloader.exceptions.LoginRequiredException:
-            print(f"❌ Login required - session may have expired")
         except Exception as e:
             print(f"❌ Error checking @{username}: {e}")
     
@@ -309,17 +327,18 @@ class StoryMonitor:
         print(f"👥 Monitoring: {', '.join(USERNAMES)}")
         print(f"⏱️  Check interval: {CHECK_INTERVAL} seconds")
         
+        Thread(target=start_http_server, daemon=True).start()
+        
         try:
             while True:
                 self.run_check_cycle()
-                print(f"\n💤 Sleeping for {CHECK_INTERVAL} seconds...")
+                print(f"💤 Sleeping for {CHECK_INTERVAL} seconds...\n")
                 time.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
-            print("\n\n🛑 Shutting down gracefully...")
+            print("\n🛑 Shutting down gracefully...")
         finally:
             self.session_manager.cleanup()
             print("👋 Goodbye!")
-
 
 if __name__ == "__main__":
     monitor = StoryMonitor()

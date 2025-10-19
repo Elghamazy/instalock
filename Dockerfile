@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose nothing — this script runs headless
-EXPOSE 7860
+EXPOSE 8000
 
 # Command to run the monitor
 CMD ["python", "app.py"]
